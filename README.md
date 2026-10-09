@@ -49,6 +49,25 @@ region of `dc1` works without a code change.
 The endpoint is used **path-style** (`https://host/bucket/key`), which is what every
 S3-compatible implementation accepts; virtual-host style is not supported.
 
+### HTTP/1.1 or HTTP/2
+
+The endpoint decides by default: one under `your-objectstorage.com` (Hetzner Object
+Storage) is talked to over **HTTP/2**, anything else over **HTTP/1.1** — AWS S3 does not
+speak HTTP/2 at all. Either can be forced:
+
+```rust
+let s3 = S3Client::new(/* a Hetzner endpoint */).use_h1();   // back to HTTP/1.1
+let s3 = S3Client::new(/* a MinIO behind h2 */).use_h2();    // HTTP/2 elsewhere
+```
+
+The difference is what concurrent requests cost. Over HTTP/1.1 each request in flight
+holds a connection of its own; over HTTP/2 they are all multiplexed over one connection
+per endpoint, so a burst of small requests costs no new TLS handshakes.
+
+Streamed uploads — `upload_streamed`, `upload_with_writer`, `start_upload` and their
+retrying variants — go over HTTP/1.1 whatever is set: `fl-url` streams a request body
+over HTTP/1.1 only.
+
 ### Seeing what goes out
 
 ```rust

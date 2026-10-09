@@ -268,9 +268,8 @@ mod tests {
         writer.write_all(&[7u8; 600]).await.unwrap();
         drop(writer);
 
-        let upload = tokio::spawn(async {
-            Err(S3Error::Other("the storage saw a short body".to_string()))
-        });
+        let upload =
+            tokio::spawn(async { Err(S3Error::Other("the storage saw a short body".to_string())) });
         let handle = S3UploadHandle::new(upload, state, "my-bucket", "a.bin");
 
         let err = handle.finish().await.unwrap_err();

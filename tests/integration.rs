@@ -1200,7 +1200,9 @@ async fn bailing_out_after_writing_past_the_length_stores_nothing() {
 
     let err = handle.finish().await.unwrap_err();
 
-    let io_error = err.get_upload_producer_error().expect("the writer's failure");
+    let io_error = err
+        .get_upload_producer_error()
+        .expect("the writer's failure");
     assert_eq!(io_error.kind(), std::io::ErrorKind::UnexpectedEof);
     assert!(
         io_error.to_string().contains("only 0 of the 1000"),
@@ -1498,8 +1500,12 @@ async fn nothing_touches_the_network_before_the_first_chunk() {
     let content = pattern(2 * my_s3::DEFAULT_UPLOAD_CHUNK_SIZE + 1_000);
     let first_chunk = my_s3::DEFAULT_UPLOAD_CHUNK_SIZE;
 
-    let (mut writer, handle) =
-        client.start_upload("my-bucket", "archives/lazy.bin", content.len(), UPLOAD_TIMEOUT);
+    let (mut writer, handle) = client.start_upload(
+        "my-bucket",
+        "archives/lazy.bin",
+        content.len(),
+        UPLOAD_TIMEOUT,
+    );
 
     writer.write_all(&content[..100]).await.unwrap();
 
@@ -1583,8 +1589,12 @@ async fn two_started_uploads_run_side_by_side() {
         .map(|index| (index % 241) as u8)
         .collect();
 
-    let (mut first_writer, first_handle) =
-        client.start_upload("my-bucket", "archives/first.bin", first.len(), UPLOAD_TIMEOUT);
+    let (mut first_writer, first_handle) = client.start_upload(
+        "my-bucket",
+        "archives/first.bin",
+        first.len(),
+        UPLOAD_TIMEOUT,
+    );
     let (mut second_writer, second_handle) = client.start_upload(
         "my-bucket",
         "archives/second.bin",
@@ -2716,10 +2726,7 @@ async fn a_streamed_download_delivers_the_whole_object() {
 
     server.push_reply(200, "the whole object, one chunk or several");
 
-    let mut stream = client
-        .download_file("my-bucket", "a.bin")
-        .await
-        .unwrap();
+    let mut stream = client.download_file("my-bucket", "a.bin").await.unwrap();
 
     let mut body = Vec::new();
     while let Some(chunk) = stream.get_next_chunk().await.unwrap() {
@@ -2744,10 +2751,7 @@ async fn a_streamed_download_carries_the_length_and_the_type() {
 
     server.push_reply(200, "0123456789");
 
-    let stream = client
-        .download_file("my-bucket", "a.bin")
-        .await
-        .unwrap();
+    let stream = client.download_file("my-bucket", "a.bin").await.unwrap();
 
     assert_eq!(stream.content_length, Some(10));
     assert_eq!(stream.content_type.as_deref(), Some("application/xml"));
@@ -2780,10 +2784,7 @@ async fn a_body_that_ends_early_is_an_error_not_a_short_file() {
 
     server.push_truncated_reply("truncated", 64);
 
-    let mut stream = client
-        .download_file("my-bucket", "a.bin")
-        .await
-        .unwrap();
+    let mut stream = client.download_file("my-bucket", "a.bin").await.unwrap();
 
     assert_eq!(stream.content_length, Some(64));
 
@@ -2817,10 +2818,7 @@ async fn a_streamed_download_survives_debug_mode() {
 
     server.push_reply(200, "contents");
 
-    let mut stream = client
-        .download_file("my-bucket", "a.bin")
-        .await
-        .unwrap();
+    let mut stream = client.download_file("my-bucket", "a.bin").await.unwrap();
 
     let mut body = Vec::new();
     while let Some(chunk) = stream.get_next_chunk().await.unwrap() {
@@ -3393,6 +3391,89 @@ async fn a_cancelled_read_is_resumed_without_a_second_get() {
     // The HEAD, and the single GET that was started before the cancellation.
     assert_eq!(server.request_count(), 2);
     assert_eq!(server.captured()[1].header("range"), Some("bytes=0-15"));
+}
+
+// ---------------------------------------------------------------------------
+// HTTP version
+// ---------------------------------------------------------------------------
+
+/// What every HTTP/2 connection opens with (RFC 9113 §3.4), before a single frame.
+const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// `use_h2` has to reach the wire, not only the builder. Over `http://` there is no ALPN
+/// to negotiate it, so the client opens with the preface straight away - which is what
+/// a raw socket can see without an HTTP/2 server behind it.
+#[tokio::test]
+async fn use_h2_opens_the_connection_with_the_http2_preface() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+
+    let client = my_s3::S3Client::new(
+        fake_s3::ACCESS_KEY,
+        fake_s3::SECRET_KEY,
+        fake_s3::REGION,
+        endpoint,
+    )
+    .use_h2();
+
+    let request = tokio::spawn(async move { client.check_if_bucket_exists("my-bucket").await });
+
+    let (mut socket, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+        .await
+        .expect("the client never connected")
+        .unwrap();
+
+    let mut opening = vec![0u8; H2_PREFACE.len()];
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::io::AsyncReadExt::read_exact(&mut socket, &mut opening),
+    )
+    .await
+    .expect("the client sent less than a preface")
+    .unwrap();
+
+    assert_eq!(
+        opening,
+        H2_PREFACE,
+        "got {:?}",
+        String::from_utf8_lossy(&opening)
+    );
+
+    // Nobody answers, so the request can only fail - but it has to end.
+    drop(socket);
+    drop(listener);
+    let result = tokio::time::timeout(Duration::from_secs(30), request)
+        .await
+        .expect("the request outlived its connection")
+        .unwrap();
+    assert!(result.is_err(), "got {:?}", result);
+}
+
+/// `fl-url` streams a request body over HTTP/1.1 only, and `use_h2` is documented not to
+/// change that. `FakeS3` speaks nothing but HTTP/1.1, so the upload landing intact is
+/// the proof.
+#[tokio::test]
+async fn a_streamed_upload_stays_on_http1_under_use_h2() {
+    let server = FakeS3::start().await;
+    let client = server.client().use_h2();
+
+    let content = pattern(300 * 1024);
+
+    client
+        .upload_streamed(
+            "my-bucket",
+            "big.bin",
+            body_from(content.clone(), 64 * 1024),
+            content.len(),
+            UPLOAD_TIMEOUT,
+        )
+        .await
+        .unwrap();
+
+    let captured = server.captured();
+    assert_eq!(captured.len(), 1);
+    assert!(captured[0].signature_valid, "{:?}", captured[0]);
+    assert_eq!(captured[0].body, content);
 }
 
 // ---------------------------------------------------------------------------

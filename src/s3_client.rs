@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::time::Duration;
 
-use flurl::FlUrlResponse;
+use flurl::{FlUrlMode, FlUrlResponse};
 use my_http_client::RequestBodyStream;
 use tokio::sync::mpsc::Receiver;
 
@@ -31,6 +31,11 @@ const NO_VALUE: Option<&str> = None;
 /// fails with `FlUrlError::ResponseBodyTooLarge` instead of being held.
 const MAX_ANSWER_SIZE: usize = 10 * 1024 * 1024;
 
+/// The domain every Hetzner Object Storage endpoint lives under -
+/// `https://fsn1.your-objectstorage.com`. Those endpoints speak HTTP/2, so a client
+/// addressed at one uses it unless told otherwise.
+const HETZNER_DOMAIN: &str = "your-objectstorage.com";
+
 /// `Clone` because [`Self::open_reader`] hands one to every [`S3Reader`]: the ranged
 /// `GET`s a reader issues are `'static` futures, so they cannot borrow the client they
 /// came from - and so does [`Self::start_upload`], for the task its request runs on. The
@@ -46,6 +51,9 @@ pub struct S3Client {
     pub endpoint: String,
     /// Off unless [`Self::debug_to_console`] turned it on.
     debug_to_console: bool,
+    /// Set by [`Self::use_h1`] or [`Self::use_h2`]. `None` leaves it to the endpoint -
+    /// see [`Self::use_h2`].
+    http_mode: Option<FlUrlMode>,
 }
 
 impl S3Client {
@@ -61,6 +69,7 @@ impl S3Client {
             region: region.into(),
             endpoint: endpoint.into(),
             debug_to_console: false,
+            http_mode: None,
         }
     }
 
@@ -94,6 +103,45 @@ impl S3Client {
         self.debug_to_console = true;
         self
     }
+
+    /// Talks to the storage over HTTP/1.1, whatever the endpoint.
+    ///
+    /// This is already what every endpoint but Hetzner's gets - AWS S3 does not speak
+    /// HTTP/2 at all. It is for turning HTTP/2 off on a Hetzner endpoint, which
+    /// [`Self::use_h2`] describes.
+    ///
+    /// The later of [`Self::use_h1`] and [`Self::use_h2`] wins.
+    pub fn use_h1(mut self) -> Self {
+        self.http_mode = Some(FlUrlMode::Http1Hyper);
+        self
+    }
+
+    /// Talks to the storage over HTTP/2, whatever the endpoint.
+    ///
+    /// Without either this or [`Self::use_h1`], the endpoint decides: one under
+    /// `your-objectstorage.com` - Hetzner Object Storage - gets HTTP/2, anything else
+    /// HTTP/1.1. Set this for another storage that speaks HTTP/2; a storage that does
+    /// not fails every request.
+    ///
+    /// What changes is how concurrent requests reach the storage. Over HTTP/1.1 every
+    /// request in flight holds a connection of its own, and the pool keeps a few idle
+    /// ones per endpoint. Over HTTP/2 all of them are multiplexed over **one**
+    /// connection per endpoint, so a burst of small requests costs no new TLS
+    /// handshakes.
+    ///
+    /// # Streamed uploads stay on HTTP/1.1
+    ///
+    /// [`Self::upload_streamed`], [`Self::upload_with_writer`], [`Self::start_upload`]
+    /// and their retrying variants go over HTTP/1.1 whatever is set here: `fl-url`
+    /// streams a request body over HTTP/1.1 only. Every other call - [`Self::upload`],
+    /// downloads, `HEAD`s, listings - uses the version chosen.
+    ///
+    /// The later of [`Self::use_h1`] and [`Self::use_h2`] wins.
+    pub fn use_h2(mut self) -> Self {
+        self.http_mode = Some(FlUrlMode::H2);
+        self
+    }
+
     /// Uploads an object that is already fully in memory.
     ///
     /// Peak memory is the size of `content` (plus whatever the caller holds), so this
@@ -115,7 +163,8 @@ impl S3Client {
         content: Vec<u8>,
         upload_timeout: Duration,
     ) -> Result<(), S3Error> {
-        let fl_url = flurl::FlUrl::new(self.endpoint.as_str())
+        let fl_url = self
+            .new_request()
             .append_path_segment(bucket_name)
             .append_path_segment(key)
             .set_timeout(upload_timeout)
@@ -228,7 +277,8 @@ impl S3Client {
     ) -> Result<(), S3Error> {
         // No `with_retries`: it is ignored on this path, and setting it would suggest
         // otherwise at the call site.
-        let fl_url = flurl::FlUrl::new(self.endpoint.as_str())
+        let fl_url = self
+            .new_request()
             .append_path_segment(bucket_name)
             .append_path_segment(key)
             .set_timeout(upload_timeout);
@@ -716,7 +766,8 @@ impl S3Client {
         key: &str,
         range: Option<(u64, Option<u64>)>,
     ) -> Result<FlUrlResponse, S3Error> {
-        let fl_url = flurl::FlUrl::new(self.endpoint.as_str())
+        let fl_url = self
+            .new_request()
             .append_path_segment(bucket_name)
             .append_path_segment(key)
             .with_retries(3);
@@ -780,7 +831,8 @@ impl S3Client {
     /// deleting a key that is not there is also a success - the operation is
     /// idempotent, so a missing key is not reported as [`S3Error::KeyNotFound`].
     pub async fn delete_file(&self, bucket_name: &str, key: &str) -> Result<(), S3Error> {
-        let fl_url = flurl::FlUrl::new(self.endpoint.as_str())
+        let fl_url = self
+            .new_request()
             .append_path_segment(bucket_name)
             .append_path_segment(key)
             .with_retries(3);
@@ -804,7 +856,8 @@ impl S3Client {
     /// see [`Self::create_bucket_if_not_exists`] for treating that as success, or
     /// [`S3Error::bucket_name_is_taken`] to decide it at the call site.
     pub async fn create_bucket(&self, bucket_name: &str) -> Result<(), S3Error> {
-        let fl_url = flurl::FlUrl::new(self.endpoint.as_str())
+        let fl_url = self
+            .new_request()
             .append_path_segment(bucket_name)
             .with_retries(3);
 
@@ -847,7 +900,8 @@ impl S3Client {
     /// A region this crate does not have a variant for comes back as
     /// [`S3Region::Other`], carried verbatim.
     pub async fn get_bucket_location(&self, bucket_name: &str) -> Result<S3Region, S3Error> {
-        let fl_url = flurl::FlUrl::new(self.endpoint.as_str())
+        let fl_url = self
+            .new_request()
             .append_path_segment(bucket_name)
             .append_query_param("location", NO_VALUE)
             .with_retries(3);
@@ -875,7 +929,8 @@ impl S3Client {
     /// The answer to a `HEAD` carries **no body**, so a failure here has no
     /// `<Error><Code>` to be typed from - the status code is all there is.
     pub async fn check_if_bucket_exists(&self, bucket_name: &str) -> Result<bool, S3Error> {
-        let fl_url = flurl::FlUrl::new(self.endpoint.as_str())
+        let fl_url = self
+            .new_request()
             .append_path_segment(bucket_name)
             .with_retries(3);
 
@@ -981,7 +1036,8 @@ impl S3Client {
         path_and_query.push('?');
         path_and_query.push_str(query.as_str());
 
-        let fl_url = flurl::FlUrl::new(self.endpoint.as_str())
+        let fl_url = self
+            .new_request()
             .append_raw_ending_to_url(path_and_query)
             .with_retries(3);
 
@@ -1012,7 +1068,8 @@ impl S3Client {
     /// # }
     /// ```
     pub async fn get_object_size(&self, bucket_name: &str, key: &str) -> Result<u64, S3Error> {
-        let fl_url = flurl::FlUrl::new(self.endpoint.as_str())
+        let fl_url = self
+            .new_request()
             .append_path_segment(bucket_name)
             .append_path_segment(key)
             .with_retries(3);
@@ -1095,6 +1152,37 @@ impl S3Client {
         match self.create_bucket(bucket_name).await {
             Err(err) if err.is_bucket_already_owned_by_you() => Ok(()),
             result => result,
+        }
+    }
+
+    /// A request to [`Self::endpoint`], in the HTTP version this client talks - the one
+    /// place every request starts from, so none of them can miss the setting.
+    ///
+    /// Decided per request rather than once in [`Self::new`]: `endpoint` is a public
+    /// field, and a client whose endpoint was changed afterwards must not keep talking
+    /// the previous endpoint's version.
+    fn new_request(&self) -> flurl::FlUrl {
+        let fl_url = flurl::FlUrl::new(self.endpoint.as_str());
+        let mode = self.http_mode_for(&fl_url);
+        fl_url.update_mode(mode)
+    }
+
+    fn http_mode_for(&self, fl_url: &flurl::FlUrl) -> FlUrlMode {
+        if let Some(mode) = self.http_mode {
+            return mode;
+        }
+
+        // The host as `fl-url` itself parsed it, so the decision is made on the very
+        // host the request goes to. A url it could not parse fails at signing, whatever
+        // the mode says.
+        let is_hetzner = fl_url
+            .get_url_builder()
+            .is_ok_and(|url_builder| is_hetzner_host(url_builder.get_host()));
+
+        if is_hetzner {
+            FlUrlMode::H2
+        } else {
+            FlUrlMode::Http1Hyper
         }
     }
 
@@ -1313,6 +1401,25 @@ fn create_bucket_configuration(region: &S3Region) -> Option<Vec<u8>> {
     Some(configuration.into_bytes())
 }
 
+/// Whether `host` is [`HETZNER_DOMAIN`] or a name under it.
+///
+/// Compared on bytes, ignoring ASCII case the way DNS does: slicing the `str` at a fixed
+/// length from the end would panic on a host with a multi-byte character there.
+fn is_hetzner_host(host: &str) -> bool {
+    let host = host.as_bytes();
+
+    let Some(prefix_length) = host.len().checked_sub(HETZNER_DOMAIN.len()) else {
+        return false;
+    };
+
+    // `notyour-objectstorage.com` ends the same way and is somebody else's.
+    if prefix_length > 0 && host[prefix_length - 1] != b'.' {
+        return false;
+    }
+
+    host[prefix_length..].eq_ignore_ascii_case(HETZNER_DOMAIN.as_bytes())
+}
+
 /// Any 2xx is a success.
 ///
 /// Checking `== 200` is wrong for a whole class of S3 operations: `DeleteObject`
@@ -1400,6 +1507,74 @@ fn map_error_code(error_code: &str) -> Option<S3Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn talks_h2(client: &S3Client) -> bool {
+        client
+            .http_mode_for(&flurl::FlUrl::new(client.endpoint.as_str()))
+            .is_h2()
+    }
+
+    fn client_for(endpoint: &str) -> S3Client {
+        S3Client::new("access-key", "secret-key", "fsn1", endpoint)
+    }
+
+    #[test]
+    fn a_hetzner_endpoint_talks_h2_by_default() {
+        for endpoint in [
+            "https://fsn1.your-objectstorage.com",
+            "https://nbg1.your-objectstorage.com/",
+            "https://hel1.your-objectstorage.com:443",
+            "https://FSN1.Your-ObjectStorage.com",
+            // A location this crate has never heard of is still Hetzner's.
+            "https://xyz9.your-objectstorage.com",
+        ] {
+            assert!(talks_h2(&client_for(endpoint)), "{}", endpoint);
+        }
+    }
+
+    /// AWS S3 does not speak HTTP/2, and neither does a storage nobody has said does.
+    #[test]
+    fn any_other_endpoint_talks_h1_by_default() {
+        for endpoint in [
+            "https://s3.eu-west-1.amazonaws.com",
+            "http://127.0.0.1:9000",
+            "https://notyour-objectstorage.com",
+            "https://your-objectstorage.com.example.org",
+            "https://minio.internal/your-objectstorage.com",
+            "https://ŝ.example",
+            "http://",
+        ] {
+            assert!(!talks_h2(&client_for(endpoint)), "{}", endpoint);
+        }
+    }
+
+    #[test]
+    fn use_h1_and_use_h2_override_the_endpoint() {
+        assert!(!talks_h2(
+            &client_for("https://fsn1.your-objectstorage.com").use_h1()
+        ));
+        assert!(talks_h2(
+            &client_for("https://s3.eu-west-1.amazonaws.com").use_h2()
+        ));
+    }
+
+    #[test]
+    fn the_later_of_use_h1_and_use_h2_wins() {
+        let endpoint = "https://s3.eu-west-1.amazonaws.com";
+
+        assert!(talks_h2(&client_for(endpoint).use_h1().use_h2()));
+        assert!(!talks_h2(&client_for(endpoint).use_h2().use_h1()));
+    }
+
+    /// `endpoint` is a public field: the version follows it, rather than whatever it
+    /// was when the client was built.
+    #[test]
+    fn the_default_follows_a_changed_endpoint() {
+        let mut client = client_for("https://s3.eu-west-1.amazonaws.com");
+        client.endpoint = "https://fsn1.your-objectstorage.com".to_string();
+
+        assert!(talks_h2(&client));
+    }
 
     #[test]
     fn delete_returns_204_which_is_a_success() {

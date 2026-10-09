@@ -326,9 +326,7 @@ async fn serve_connection(
         let abort_after = state.abort_after.lock().unwrap().take();
         let answer_after = state.answer_after.lock().unwrap().take();
 
-        let cut_after = abort_after.or(answer_after
-            .as_ref()
-            .map(|(after_bytes, _)| *after_bytes));
+        let cut_after = abort_after.or(answer_after.as_ref().map(|(after_bytes, _)| *after_bytes));
 
         let body: Vec<u8> = if is_chunked {
             read_chunked_body(&mut stream, &mut buffer).await?
