@@ -124,11 +124,13 @@ s3.upload(&conn.bucket, "config.json", bytes, Duration::from_secs(30)).await?;
 * An empty value of a required name counts as missing.
 * Names match case-insensitively — `endpoint=` works too. The documented spelling is
   PascalCase.
-* An unknown name is an error, and so is a name given twice: a typo like `Secret_Key`
-  must not silently mean "no secret" and surface later as a `403`.
+* A pair whose name is none of the above is skipped. A misspelt required name therefore
+  surfaces as that name missing (`Secret_Key=...` is "SecretKey is missing"); a misspelt
+  `Prefix` or `Debug` is the same as leaving it out.
+* A name given twice is an error.
 
 **`parse` never panics.** It returns an `S3ConnectionStringError` — `NotAPair`,
-`UnknownName`, `GivenTwice`, `Missing`, `Empty` or `DebugNotABoolean` — whose message says
+`GivenTwice`, `Missing`, `Empty` or `DebugNotABoolean` — whose message says
 what is wrong and the shape that was expected. A console that serves several buckets
 shows a bad string next to the ones that work; a service that cannot run without its
 bucket calls `.expect("s3_conn_string")`.
@@ -136,8 +138,7 @@ bucket calls `.expect("s3_conn_string")`.
 **No secret comes back out.** The `Debug` of `S3ConnectionString` writes the secret key
 as `***`, and an error never quotes a value whole. A pair without `=` may be the secret
 key that lost its name, so the error shows its beginning and its length:
-`abc/… (40 characters)`. An unknown name is quoted whole only while it looks like a name
-— at most 16 characters, letters, digits, `_` or `-` — and like a value otherwise.
+`abc/… (40 characters)`.
 
 ## Buckets
 

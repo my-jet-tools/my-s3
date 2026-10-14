@@ -22,11 +22,6 @@ const EXPECTED_BOOLEAN: &str = "1/0, true/false, yes/no or on/off";
 /// of it, so a short value does not come out whole either.
 const QUOTED_HEAD_LENGTH: usize = 4;
 
-/// The longest unknown name an error quotes whole. The longest real one is 9 characters,
-/// so a typo of it fits; an access key (20 characters at AWS and Hetzner) or a secret key
-/// (40) does not, and is quoted like a value.
-const NAME_MAX_LENGTH: usize = 16;
-
 /// Everything needed to reach one bucket, in one settings value:
 ///
 /// ```text
@@ -39,8 +34,9 @@ const NAME_MAX_LENGTH: usize = 16;
 /// * `Endpoint`, `Region`, `AccessKey`, `SecretKey` and `Bucket` are required, and an
 ///   empty value counts as missing. `Prefix` and `Debug` are optional.
 /// * Names match case-insensitively: `endpoint=` is `Endpoint=`.
-/// * An unknown name is an error, and so is a name given twice: a typo such as
-///   `Secret_Key` must not mean "no secret" and surface later as a `403`.
+/// * A pair whose name is none of these is skipped, its value unread.
+/// * A name given twice is an error: which of the two was meant is not for the parser to
+///   guess.
 ///
 /// The secret key does not come back out: [`Debug`](std::fmt::Debug) writes it as `***`,
 /// and an error never quotes a value whole - see [`S3ConnectionStringError`].
@@ -113,7 +109,7 @@ impl S3ConnectionString {
                 .iter_mut()
                 .find(|(known_name, _)| known_name.eq_ignore_ascii_case(name))
             else {
-                return Err(S3ConnectionStringError::UnknownName(quote_name(name)));
+                continue;
             };
 
             if slot.replace(value).is_some() {
@@ -185,9 +181,8 @@ impl std::fmt::Debug for S3ConnectionString {
 /// Why a connection string could not be read.
 ///
 /// No case carries a value whole, because a value may be the secret key: what it quotes
-/// is the value's beginning and its length - `abc/… (40 characters)`. An unknown name is
-/// quoted whole only while it looks like a name. So the error can be printed anywhere,
-/// `{:?}` included.
+/// is the value's beginning and its length - `abc/… (40 characters)`. So the error can be
+/// printed anywhere, `{:?}` included.
 ///
 /// [`Display`](std::fmt::Display) says what is wrong, and the shape that was expected.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,9 +190,6 @@ pub enum S3ConnectionStringError {
     /// A pair with no `=`, or nothing before it. Quoted like a value: it may be the secret
     /// key that lost its name.
     NotAPair(String),
-    /// A name the string does not know. Quoted whole while it looks like a name - short,
-    /// and letters, digits, `_` or `-` only - and like a value otherwise.
-    UnknownName(String),
     /// A name given twice, in its documented spelling.
     GivenTwice(&'static str),
     /// A required name that is not there.
@@ -218,9 +210,6 @@ impl std::fmt::Display for S3ConnectionStringError {
                     "not a Key=Value pair: {}, expected {}",
                     pair, EXPECTED_SHAPE
                 )
-            }
-            Self::UnknownName(name) => {
-                write!(f, "unknown name: {}, expected {}", name, EXPECTED_SHAPE)
             }
             Self::GivenTwice(name) => {
                 write!(f, "{} is given twice, expected {}", name, EXPECTED_SHAPE)
@@ -277,21 +266,6 @@ fn quote_value(value: &str) -> String {
     };
 
     format!("{}… ({} {})", head, length, unit)
-}
-
-/// A typo is found faster when it can be read, so a name is quoted whole. Anything that
-/// does not look like one may be a value that lost its own name, and is quoted like one.
-fn quote_name(name: &str) -> String {
-    let looks_like_a_name = name.len() <= NAME_MAX_LENGTH
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-
-    if looks_like_a_name {
-        name.to_string()
-    } else {
-        quote_value(name)
-    }
 }
 
 #[cfg(test)]
@@ -476,43 +450,31 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_name_is_an_error_not_ignored() {
+    fn an_unknown_name_is_skipped() {
+        for unknown in [
+            "Timeout=30",
+            "Owner=my-team;Owner=other-team",
+            "Secret Key=",
+            "abc/def+ghi=",
+        ] {
+            let parsed = parse(&format!("{};{};Prefix=p", SERVICES_STRING, unknown)).unwrap();
+
+            assert_eq!(parsed.secret_key, "abc/def+ghi=", "{}", unknown);
+            assert_eq!(parsed.bucket, "my-bucket", "{}", unknown);
+            assert_eq!(parsed.prefix.as_deref(), Some("p"), "{}", unknown);
+        }
+    }
+
+    /// A misspelt required name is skipped like any other, so it surfaces as that name
+    /// missing - without the value it carried.
+    #[test]
+    fn a_misspelt_required_name_is_missing() {
         let err =
             parse("Endpoint=https://s3;Region=eu;AccessKey=a;Secret_Key=abc/def+ghi=;Bucket=c")
                 .unwrap_err();
 
-        assert_eq!(
-            err,
-            S3ConnectionStringError::UnknownName("Secret_Key".to_string())
-        );
-        assert!(
-            err.to_string().contains("unknown name: Secret_Key"),
-            "{}",
-            err
-        );
+        assert_eq!(err, S3ConnectionStringError::Missing(SECRET_KEY));
         assert!(!err.to_string().contains("abc/def+ghi="), "{}", err);
-    }
-
-    /// A secret that lost its name keeps its own `=` padding, and so arrives where a name
-    /// would.
-    #[test]
-    fn an_unknown_name_that_does_not_look_like_one_is_quoted_like_a_value() {
-        for (name, quoted) in [
-            ("abc/def+ghi", "abc/… (11 characters)"),
-            (
-                "ABCDEFGHIJKLMNOPQRST0123456789abcdefghij",
-                "ABCD… (40 characters)",
-            ),
-            ("Secret Key", "Secr… (10 characters)"),
-        ] {
-            let err = parse(&format!("{};{}=", SERVICES_STRING, name)).unwrap_err();
-
-            assert_eq!(
-                err,
-                S3ConnectionStringError::UnknownName(quoted.to_string())
-            );
-            assert!(!err.to_string().contains(name), "{}", err);
-        }
     }
 
     #[test]
@@ -604,7 +566,6 @@ mod tests {
     fn every_error_names_what_was_expected() {
         for err in [
             S3ConnectionStringError::NotAPair("abc/… (40 characters)".to_string()),
-            S3ConnectionStringError::UnknownName("Secret_Key".to_string()),
             S3ConnectionStringError::GivenTwice(BUCKET),
             S3ConnectionStringError::Missing(BUCKET),
             S3ConnectionStringError::Empty(BUCKET),
