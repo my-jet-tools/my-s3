@@ -37,6 +37,15 @@ let s3 = S3Client::new(
 );
 ```
 
+Or from one settings value, which also names the bucket — see
+[A connection string](#a-connection-string):
+
+```rust
+use my_s3::S3ConnectionString;
+
+let s3 = S3ConnectionString::parse(&settings.s3_conn_string)?.create_client();
+```
+
 `S3Client` is cheap, `Send + Sync`, and holds no connection of its own — `fl-url` pools
 those process-wide — so build one at startup and share it by reference.
 
@@ -77,6 +86,58 @@ let s3 = S3Client::new(/* ... */).debug_to_console();
 Prints every request as it is sent, and a failed answer's body in full — that body is the
 `<Error><Code>` that says why. A successful answer is printed as a size, since it is the
 object that was just downloaded. `Authorization` is never printed.
+
+## A connection string
+
+Everything a service needs to reach its bucket, in one settings value:
+
+```text
+Endpoint=https://fsn1.your-objectstorage.com;Region=fsn1;AccessKey=...;SecretKey=...;Bucket=my-bucket
+```
+
+```rust
+use my_s3::S3ConnectionString;
+
+let conn = S3ConnectionString::parse(&settings.s3_conn_string)?;
+let s3 = conn.create_client();
+
+s3.upload(&conn.bucket, "config.json", bytes, Duration::from_secs(30)).await?;
+```
+
+`create_client` is `S3Client::new(access_key, secret_key, region, endpoint)`, plus
+`debug_to_console()` when the string says `Debug=1`. `S3ConnectionString` implements
+`FromStr` too, so `settings.s3_conn_string.parse::<S3ConnectionString>()` works.
+
+| Name | | |
+| --- | --- | --- |
+| `Endpoint` | required | A trailing `/` is cut off, so `https://host/` works. |
+| `Region` | required | |
+| `AccessKey` | required | |
+| `SecretKey` | required | |
+| `Bucket` | required | |
+| `Prefix` | optional | The folder the keys go under. `None` when it is not given, or given empty. |
+| `Debug` | optional | `1/0`, `true/false`, `yes/no` or `on/off`, in any case. Any other value is an error, not "off". |
+
+* Pairs are separated by `;`. Empty pairs (`;;`, a trailing `;`) are skipped, and the
+  whitespace around names and values is trimmed.
+* A pair splits at its **first** `=` only, because a base64 secret key ends in `=`.
+* An empty value of a required name counts as missing.
+* Names match case-insensitively — `endpoint=` works too. The documented spelling is
+  PascalCase.
+* An unknown name is an error, and so is a name given twice: a typo like `Secret_Key`
+  must not silently mean "no secret" and surface later as a `403`.
+
+**`parse` never panics.** It returns an `S3ConnectionStringError` — `NotAPair`,
+`UnknownName`, `GivenTwice`, `Missing`, `Empty` or `DebugNotABoolean` — whose message says
+what is wrong and the shape that was expected. A console that serves several buckets
+shows a bad string next to the ones that work; a service that cannot run without its
+bucket calls `.expect("s3_conn_string")`.
+
+**No secret comes back out.** The `Debug` of `S3ConnectionString` writes the secret key
+as `***`, and an error never quotes a value whole. A pair without `=` may be the secret
+key that lost its name, so the error shows its beginning and its length:
+`abc/… (40 characters)`. An unknown name is quoted whole only while it looks like a name
+— at most 16 characters, letters, digits, `_` or `-` — and like a value otherwise.
 
 ## Buckets
 

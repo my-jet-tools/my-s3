@@ -123,6 +123,56 @@ async fn an_unusable_endpoint_is_an_error_saying_why() {
     assert!(!err.is_retryable(), "bad input must not be retried");
 }
 
+/// A client built from a connection string talks to the storage with what the string
+/// says: the signature verifies only with its secret key and region, the access key is
+/// the one in the credential, and the request reaches its bucket - through an endpoint
+/// written with a trailing `/`.
+#[tokio::test]
+async fn a_client_from_a_connection_string_is_signed_with_its_values() {
+    let server = FakeS3::start().await;
+
+    let connection_string: my_s3::S3ConnectionString = format!(
+        "Endpoint={}/;Region={};AccessKey={};SecretKey={};Bucket=my-bucket",
+        server.endpoint,
+        fake_s3::REGION,
+        fake_s3::ACCESS_KEY,
+        fake_s3::SECRET_KEY
+    )
+    .parse()
+    .unwrap();
+
+    connection_string
+        .create_client()
+        .upload(
+            connection_string.bucket.as_str(),
+            "hello.txt",
+            b"hello".to_vec(),
+            UPLOAD_TIMEOUT,
+        )
+        .await
+        .unwrap();
+
+    let captured = server.captured();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].target, "/my-bucket/hello.txt");
+    assert!(
+        captured[0].signature_valid,
+        "signature did not verify: {:?}",
+        captured[0]
+    );
+
+    let authorization = captured[0].header("authorization").unwrap();
+    assert!(
+        authorization.contains(&format!("Credential={}/", fake_s3::ACCESS_KEY)),
+        "got {:?}",
+        authorization
+    );
+    assert_eq!(
+        server.uploaded_object("my-bucket", "hello.txt").as_deref(),
+        Some(b"hello".as_slice())
+    );
+}
+
 /// Keys with slashes must go out as a path so objects appear as folders in the bucket -
 /// percent-encoding the separator would create one object literally named `a%2Fb`.
 #[tokio::test]

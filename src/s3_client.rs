@@ -50,7 +50,7 @@ pub struct S3Client {
     pub region: S3Region,
     pub endpoint: String,
     /// Off unless [`Self::debug_to_console`] turned it on.
-    debug_to_console: bool,
+    pub(crate) debug_to_console: bool,
     /// Set by [`Self::use_h1`] or [`Self::use_h2`]. `None` leaves it to the endpoint -
     /// see [`Self::use_h2`].
     http_mode: Option<FlUrlMode>,
