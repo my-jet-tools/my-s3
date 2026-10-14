@@ -70,11 +70,12 @@ struct State {
     /// test can still inject whatever answer it wants at any point.
     replies: Mutex<VecDeque<Reply>>,
     captured: Mutex<Vec<Captured>>,
-    /// Objects this server actually holds, keyed by request path (`/bucket/key`).
+    /// Objects this server actually holds, keyed by path with the percent-encoding undone
+    /// (`/bucket/my folder/a.txt`) - the key as the storage reads it, not as it was sent.
     ///
-    /// Empty unless a test called [`FakeS3::put_object`], and that is what keeps the
-    /// default behaviour - "200 with no body" - the same for every test that does not
-    /// use it.
+    /// Empty unless a test called [`FakeS3::put_object`] or copied an object, and that is
+    /// what keeps the default behaviour - "200 with no body" - the same for every test
+    /// that does neither.
     objects: Mutex<HashMap<String, Vec<u8>>>,
     /// How long to sit on every answer before writing it, so a test can observe a
     /// request that is genuinely still in flight rather than racing the loopback.
@@ -360,6 +361,12 @@ async fn serve_connection(
             .find(|(name, _)| name.eq_ignore_ascii_case("range"))
             .map(|(_, value)| value.clone());
 
+        let copy_source = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-amz-copy-source"))
+            .map(|(_, value)| value.clone())
+            .filter(|_| method.eq_ignore_ascii_case("PUT"));
+
         state.captured.lock().unwrap().push(Captured {
             method: method.clone(),
             target: target.clone(),
@@ -387,15 +394,21 @@ async fn serve_connection(
         // for a path this server holds an object for.
         let queued = state.replies.lock().unwrap().pop_front();
 
-        let response = match queued {
-            Some(reply) => Response::from(reply),
-            None => serve_from_objects(&state, &method, &target, range.as_deref())
+        let response = match (queued, copy_source.as_deref()) {
+            (Some(reply), _) => Response::from(reply),
+            (None, Some(copy_source)) => copy_object(&state, copy_source, &target),
+            (None, None) => serve_from_objects(&state, &method, &target, range.as_deref())
                 .unwrap_or_else(Response::empty_ok),
         };
 
         // What the storage now holds. Only a `PUT` that arrived whole and was answered
-        // with a 2xx wrote anything - a 503 means the object is exactly as it was.
-        if method.eq_ignore_ascii_case("PUT") && body_complete && is_success(response.status_code) {
+        // with a 2xx wrote anything - a 503 means the object is exactly as it was. A copy
+        // is not an upload: its body is empty, and the object it made is in `objects`.
+        if method.eq_ignore_ascii_case("PUT")
+            && copy_source.is_none()
+            && body_complete
+            && is_success(response.status_code)
+        {
             let path = match target.split_once('?') {
                 Some((path, _)) => path,
                 None => target.as_str(),
@@ -484,13 +497,7 @@ fn serve_from_objects(
         return None;
     }
 
-    // A subresource (`?location`, `?list-type=2`) is not a request for the object.
-    let path = match target.split_once('?') {
-        Some((path, _)) => path,
-        None => target,
-    };
-
-    let Some(content) = objects.get(path) else {
+    let Some(content) = objects.get(&object_path(target)) else {
         return Some(Response {
             status_code: 404,
             body: NO_SUCH_KEY.as_bytes().to_vec(),
@@ -534,6 +541,63 @@ fn serve_from_objects(
         )],
         lie_about_length: None,
     })
+}
+
+/// The object a request target names: its path with the query cut off - a subresource
+/// (`?location`, `?list-type=2`) is not part of the name - and the percent-encoding
+/// undone, so `/bucket/my%20folder/a.txt` is `/bucket/my folder/a.txt`.
+///
+/// Percent-decoding only: a `+` in a path is a `+`, not a space.
+fn object_path(target: &str) -> String {
+    let path = match target.split_once('?') {
+        Some((path, _)) => path,
+        None => target,
+    };
+
+    String::from_utf8_lossy(&percent_decode(path)).into_owned()
+}
+
+/// Copies an object the way `CopyObject` does: `x-amz-copy-source` names the source, the
+/// request path the destination, and the bytes never leave the server.
+///
+/// Both names are read by [`object_path`]: the copy source is decoded by the same rules
+/// as a path. A missing source is a `404 NoSuchKey`, as from a real S3, and leaves the
+/// destination alone.
+fn copy_object(state: &State, copy_source: &str, target: &str) -> Response {
+    // S3 takes the source with or without the leading `/`.
+    let source = object_path(&format!(
+        "/{}",
+        copy_source.strip_prefix('/').unwrap_or(copy_source)
+    ));
+
+    let mut objects = state.objects.lock().unwrap();
+
+    let Some(content) = objects.get(&source).cloned() else {
+        return Response {
+            status_code: 404,
+            body: NO_SUCH_KEY.as_bytes().to_vec(),
+            content_type: "application/xml",
+            extra_headers: Vec::new(),
+            lie_about_length: None,
+        };
+    };
+
+    // Not an MD5 as S3's would be - nothing reads it, it only has to look like an ETag.
+    let etag = hex::encode(&Sha256::digest(&content)[..16]);
+
+    objects.insert(object_path(target), content);
+
+    Response {
+        status_code: 200,
+        body: format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LastModified>2026-10-14T12:00:00.000Z</LastModified><ETag>&quot;{}&quot;</ETag></CopyObjectResult>",
+            etag
+        )
+        .into_bytes(),
+        content_type: "application/xml",
+        extra_headers: Vec::new(),
+        lie_about_length: None,
+    }
 }
 
 const NO_SUCH_KEY: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>";
@@ -703,7 +767,18 @@ async fn write_response(
 
 /// Recomputes the SigV4 signature from the request as received and compares it with the
 /// one in `Authorization`.
-fn verify_signature(method: &str, target: &str, headers: &[(String, String)], body: &[u8]) -> bool {
+///
+/// Which headers were signed is read out of `SignedHeaders`, the way a real S3 reads it,
+/// and a request is refused the way a real S3 refuses it when it carries an `x-amz-*`
+/// header that list leaves out ("There were headers present in the request which were
+/// not signed"). Without that, a client that forgot to sign `x-amz-copy-source` would
+/// pass here and be turned away by the storage.
+pub fn verify_signature(
+    method: &str,
+    target: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> bool {
     let get = |name: &str| -> Option<&str> {
         headers
             .iter()
@@ -712,9 +787,6 @@ fn verify_signature(method: &str, target: &str, headers: &[(String, String)], bo
     };
 
     let Some(authorization) = get("authorization") else {
-        return false;
-    };
-    let Some(host) = get("host") else {
         return false;
     };
     let Some(payload_hash) = get("x-amz-content-sha256") else {
@@ -748,6 +820,48 @@ fn verify_signature(method: &str, target: &str, headers: &[(String, String)], bo
         return false;
     };
 
+    let Some(signed_headers) = authorization
+        .split("SignedHeaders=")
+        .nth(1)
+        .and_then(|rest| rest.split(',').next())
+    else {
+        return false;
+    };
+
+    let names: Vec<&str> = signed_headers.split(';').collect();
+
+    // Lowercased, sorted, once each - a list in any other shape was signed over a
+    // canonical request in some other order than the one rebuilt below.
+    let well_formed = names
+        .iter()
+        .all(|name| !name.is_empty() && !name.bytes().any(|byte| byte.is_ascii_uppercase()))
+        && names.windows(2).all(|pair| pair[0] < pair[1]);
+
+    if !well_formed || !names.contains(&"host") {
+        return false;
+    }
+
+    let unsigned_amz_header = headers.iter().any(|(name, _)| {
+        let name = name.to_ascii_lowercase();
+        name.starts_with("x-amz-") && !names.contains(&name.as_str())
+    });
+
+    if unsigned_amz_header {
+        return false;
+    }
+
+    let mut canonical_headers = String::new();
+    for name in &names {
+        let Some(value) = get(name) else {
+            return false;
+        };
+
+        canonical_headers.push_str(name);
+        canonical_headers.push(':');
+        canonical_headers.push_str(&canonical_header_value(value));
+        canonical_headers.push('\n');
+    }
+
     let (path, query) = match target.split_once('?') {
         Some((path, query)) => (path, Some(query)),
         None => (target, None),
@@ -756,8 +870,8 @@ fn verify_signature(method: &str, target: &str, headers: &[(String, String)], bo
     let canonical_query = canonical_query(query.unwrap_or_default());
 
     let canonical_request = format!(
-        "{}\n{}\n{}\nhost:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\n\nhost;x-amz-content-sha256;x-amz-date\n{}",
-        method, path, canonical_query, host, payload_hash, timestamp, payload_hash
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        method, path, canonical_query, canonical_headers, signed_headers, payload_hash
     );
 
     let date = &timestamp[..8];
@@ -818,6 +932,16 @@ pub fn canonical_query(query: &str) -> String {
         .map(|(name, value)| format!("{}={}", name, value))
         .collect::<Vec<_>>()
         .join("&")
+}
+
+/// A header value as SigV4 signs it: trimmed, with each run of spaces inside it folded
+/// into one.
+fn canonical_header_value(value: &str) -> String {
+    value
+        .split(' ')
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// `%XX` back to bytes. An invalid escape is left as the literal text it is, which is

@@ -21,7 +21,8 @@ pub type HmacSha256 = Hmac<Sha256>;
 /// Call this *after* every `append_path_segment` / `append_query_param`, and before
 /// any further `with_header` that must not be signed (only `host`,
 /// `x-amz-content-sha256` and `x-amz-date` are in `SignedHeaders`, so unsigned extras
-/// such as `Range` are fine either way).
+/// such as `Range` are fine either way). An `x-amz-*` header is not such an extra: it
+/// goes through [`sign_request_with_headers`].
 ///
 /// Fails with [`S3Error::Other`] carrying the error when `fl_url` has already met one -
 /// an endpoint that is not a usable url, a header that can not be put on the wire.
@@ -31,8 +32,29 @@ pub fn sign_request(
     method: &str,
     payload: &[u8],
 ) -> Result<FlUrl, S3Error> {
+    sign_request_with_headers(s3, fl_url, method, payload, &[])
+}
+
+/// [`sign_request`] for a request that carries headers of its own which have to be
+/// signed - `x-amz-copy-source` on a `CopyObject`.
+///
+/// SigV4 signs every `x-amz-*` header of a request, and S3 refuses one that carries a
+/// header it was not signed with. So `headers` are put on the request here rather than
+/// by the caller: what is signed and what is sent can then not differ.
+///
+/// Each of them joins `host`, `x-amz-content-sha256` and `x-amz-date` in the canonical
+/// headers and in `SignedHeaders`, lowercased and in alphabetical order. Those three,
+/// and `Authorization`, are this function's to set and are not passed in. With no
+/// `headers` the request is signed byte for byte as [`sign_request`] signs it.
+pub fn sign_request_with_headers(
+    s3: &S3Client,
+    fl_url: FlUrl,
+    method: &str,
+    payload: &[u8],
+    headers: &[(&str, &str)],
+) -> Result<FlUrl, S3Error> {
     let payload_hash = hex::encode(Sha256::digest(payload));
-    sign_request_with_payload_hash(s3, fl_url, method, &payload_hash)
+    sign(s3, fl_url, method, &payload_hash, headers)
 }
 
 pub fn sign_request_with_payload_hash(
@@ -40,6 +62,16 @@ pub fn sign_request_with_payload_hash(
     fl_url: FlUrl,
     method: &str,
     payload_hash: &str,
+) -> Result<FlUrl, S3Error> {
+    sign(s3, fl_url, method, payload_hash, &[])
+}
+
+fn sign(
+    s3: &S3Client,
+    fl_url: FlUrl,
+    method: &str,
+    payload_hash: &str,
+    headers: &[(&str, &str)],
 ) -> Result<FlUrl, S3Error> {
     let service = "s3";
 
@@ -62,9 +94,14 @@ pub fn sign_request_with_payload_hash(
     let timestamp = get_amz_timestamp();
     let date = timestamp[..8].to_string();
 
-    let canonical_request = format!(
-        "{}\n{}\n{}\nhost:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\n\nhost;x-amz-content-sha256;x-amz-date\n{}",
-        method, canonical_uri, canonical_query, host, payload_hash, timestamp, payload_hash
+    let (canonical_request, signed_headers) = canonical_request(
+        method,
+        &canonical_uri,
+        &canonical_query,
+        &host,
+        payload_hash,
+        &timestamp,
+        headers,
     );
     let hashed_canonical_request = hex::encode(Sha256::digest(canonical_request.as_bytes()));
 
@@ -81,9 +118,13 @@ pub fn sign_request_with_payload_hash(
     let signature = hex::encode(mac.finalize().into_bytes());
 
     let authorization = format!(
-        "AWS4-HMAC-SHA256 Credential={}/{},SignedHeaders=host;x-amz-content-sha256;x-amz-date,Signature={}",
-        s3.access_key, scope, signature
+        "AWS4-HMAC-SHA256 Credential={}/{},SignedHeaders={},Signature={}",
+        s3.access_key, scope, signed_headers, signature
     );
+
+    let fl_url = headers
+        .iter()
+        .fold(fl_url, |fl_url, (name, value)| fl_url.with_header(*name, *value));
 
     let fl_url = fl_url
         .with_header("X-Amz-Content-Sha256", payload_hash)
@@ -91,6 +132,67 @@ pub fn sign_request_with_payload_hash(
         .with_header("Authorization", &authorization);
 
     Ok(fl_url)
+}
+
+/// The SigV4 canonical request, and the `SignedHeaders` list that goes with it.
+///
+/// `host`, `x-amz-content-sha256` and `x-amz-date` are always signed, and `headers` join
+/// them. SigV4 wants every name lowercased, one list sorted by name for both the
+/// canonical headers and `SignedHeaders`, and every value trimmed with each run of spaces
+/// inside it folded into one.
+fn canonical_request(
+    method: &str,
+    canonical_uri: &str,
+    canonical_query: &str,
+    host: &str,
+    payload_hash: &str,
+    timestamp: &str,
+    headers: &[(&str, &str)],
+) -> (String, String) {
+    let mut signed: Vec<(String, &str)> = vec![
+        ("host".to_string(), host),
+        ("x-amz-content-sha256".to_string(), payload_hash),
+        ("x-amz-date".to_string(), timestamp),
+    ];
+    signed.extend(
+        headers
+            .iter()
+            .map(|(name, value)| (name.to_ascii_lowercase(), *value)),
+    );
+    signed.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+
+    let mut canonical_headers = String::new();
+    let mut signed_headers = String::new();
+
+    for (name, value) in &signed {
+        canonical_headers.push_str(name);
+        canonical_headers.push(':');
+        push_canonical_header_value(&mut canonical_headers, value);
+        canonical_headers.push('\n');
+
+        if !signed_headers.is_empty() {
+            signed_headers.push(';');
+        }
+        signed_headers.push_str(name);
+    }
+
+    let canonical_request = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        method, canonical_uri, canonical_query, canonical_headers, signed_headers, payload_hash
+    );
+
+    (canonical_request, signed_headers)
+}
+
+/// Appends `value` the way SigV4 canonicalises a header value: without the spaces around
+/// it, and with each run of spaces inside it folded into one.
+fn push_canonical_header_value(dest: &mut String, value: &str) {
+    for (index, word) in value.split(' ').filter(|word| !word.is_empty()).enumerate() {
+        if index > 0 {
+            dest.push(' ');
+        }
+        dest.push_str(word);
+    }
 }
 
 /// Builds the SigV4 canonical query string out of the query FlUrl already encoded.
@@ -458,5 +560,119 @@ mod tests {
     fn sort_is_by_name_then_value_not_by_joined_pair() {
         assert_eq!(canonical_query_string(Some("a-b=1&a=2")), "a=2&a-b=1");
         assert_eq!(canonical_query_string(Some("k=2&k=1")), "k=1&k=2");
+    }
+
+    const EMPTY_PAYLOAD_HASH: &str =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    const TIMESTAMP: &str = "20261014T120000Z";
+
+    /// The canonical request exactly as it was built before headers could be added to
+    /// the signature - one `format!` with the three headers written into it.
+    fn canonical_request_as_it_was(
+        method: &str,
+        canonical_uri: &str,
+        canonical_query: &str,
+        host: &str,
+        payload_hash: &str,
+        timestamp: &str,
+    ) -> String {
+        format!(
+            "{}\n{}\n{}\nhost:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\n\nhost;x-amz-content-sha256;x-amz-date\n{}",
+            method, canonical_uri, canonical_query, host, payload_hash, timestamp, payload_hash
+        )
+    }
+
+    /// A signature is all or nothing: every request that signs no header of its own has
+    /// to keep producing the very bytes it always did, or it is a 403.
+    #[test]
+    fn without_extra_headers_the_canonical_request_is_the_one_it_always_was() {
+        for (method, canonical_uri, canonical_query, payload_hash) in [
+            ("GET", "/my-bucket/my%20folder/a.txt", "", EMPTY_PAYLOAD_HASH),
+            ("PUT", "/my-bucket/archives/backup.tar", "", "UNSIGNED-PAYLOAD"),
+            (
+                "GET",
+                "/my-bucket",
+                "delimiter=%2F&list-type=2&prefix=photos%2F",
+                EMPTY_PAYLOAD_HASH,
+            ),
+            ("GET", "/my-bucket", "location=", EMPTY_PAYLOAD_HASH),
+            ("HEAD", "/my-bucket", "", EMPTY_PAYLOAD_HASH),
+        ] {
+            let (canonical, signed_headers) = canonical_request(
+                method,
+                canonical_uri,
+                canonical_query,
+                "127.0.0.1:9000",
+                payload_hash,
+                TIMESTAMP,
+                &[],
+            );
+
+            assert_eq!(
+                canonical,
+                canonical_request_as_it_was(
+                    method,
+                    canonical_uri,
+                    canonical_query,
+                    "127.0.0.1:9000",
+                    payload_hash,
+                    TIMESTAMP,
+                )
+            );
+            assert_eq!(signed_headers, "host;x-amz-content-sha256;x-amz-date");
+        }
+    }
+
+    /// `x-amz-copy-source` sorts between `x-amz-content-sha256` and `x-amz-date` - `n`
+    /// before `p`, `c` before `d` - in the canonical headers and in `SignedHeaders` alike.
+    #[test]
+    fn an_extra_header_takes_its_alphabetical_place() {
+        let (canonical, signed_headers) = canonical_request(
+            "PUT",
+            "/dst-bucket/b.bin",
+            "",
+            "127.0.0.1:9000",
+            EMPTY_PAYLOAD_HASH,
+            TIMESTAMP,
+            &[("x-amz-copy-source", "/src-bucket/a.bin")],
+        );
+
+        assert_eq!(
+            signed_headers,
+            "host;x-amz-content-sha256;x-amz-copy-source;x-amz-date"
+        );
+        assert_eq!(
+            canonical,
+            format!(
+                "PUT\n/dst-bucket/b.bin\n\nhost:127.0.0.1:9000\nx-amz-content-sha256:{0}\nx-amz-copy-source:/src-bucket/a.bin\nx-amz-date:{1}\n\nhost;x-amz-content-sha256;x-amz-copy-source;x-amz-date\n{0}",
+                EMPTY_PAYLOAD_HASH, TIMESTAMP
+            )
+        );
+    }
+
+    /// The name is signed lowercased however it is sent, and the value the way the
+    /// storage will read it back: trimmed, inner runs of spaces folded into one.
+    #[test]
+    fn an_extra_header_is_canonicalised_the_sigv4_way() {
+        let (canonical, signed_headers) = canonical_request(
+            "PUT",
+            "/my-bucket/a.bin",
+            "",
+            "127.0.0.1:9000",
+            EMPTY_PAYLOAD_HASH,
+            TIMESTAMP,
+            &[("X-Amz-Meta-Note", "  two   words  ")],
+        );
+
+        assert_eq!(
+            signed_headers,
+            "host;x-amz-content-sha256;x-amz-date;x-amz-meta-note"
+        );
+        assert!(
+            canonical.contains("\nx-amz-meta-note:two words\n"),
+            "got {:?}",
+            canonical
+        );
     }
 }

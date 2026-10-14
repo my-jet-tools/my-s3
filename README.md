@@ -209,6 +209,22 @@ s3.delete_file("my-bucket", "config.json").await?;
 
 Deleting is idempotent — a key that was not there is a success, not `KeyNotFound`.
 
+S3 has no rename. Moving an object is a copy to the new key and a delete of the old one:
+
+```rust
+s3.copy_file("my-bucket", "drafts/report.pdf", "my-bucket", "published/report.pdf").await?;
+s3.delete_file("my-bucket", "drafts/report.pdf").await?;
+```
+
+`copy_file` is one `CopyObject` on the storage's side — the bytes never pass through the
+client — and copies at most 5 GB; a larger object needs a multipart `UploadPartCopy`,
+which is not implemented. The metadata is copied with the object. A missing source is
+`KeyNotFound`. A copy can fail after the storage has already answered `200 OK`, with an
+`<Error>` in the body: that is reported as an error, and only a complete
+`<CopyObjectResult>` counts as a copy. Hetzner Object Storage copies only within one
+bucket, and says a copy "may fail depending on internal factors" — such an error is
+returned as it is, and `is_retryable()` tells whether repeating it makes sense.
+
 ## Reading an object like a file
 
 `open_reader` hands back an `S3Reader`, which implements `tokio::io::AsyncRead` and

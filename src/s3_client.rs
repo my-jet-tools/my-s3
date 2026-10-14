@@ -844,6 +844,104 @@ impl S3Client {
         self.expect_success(fl_url_response).await
     }
 
+    /// Copies an object inside the storage - `PUT /{dst_bucket}/{dst_key}` with
+    /// `x-amz-copy-source: /{src_bucket}/{src_key}`.
+    ///
+    /// S3 has no rename: moving an object is this copy followed by a
+    /// [`Self::delete_file`] of the source, as in the example below.
+    ///
+    /// It is **one operation on the storage's side**: the object's bytes do not pass
+    /// through this client, whatever its size.
+    ///
+    /// - **Up to 5 GB.** That is the most one `CopyObject` copies. A larger object takes
+    ///   a multipart `UploadPartCopy`, which this crate does not implement.
+    /// - **The metadata is copied with the object**: `x-amz-metadata-directive` is not
+    ///   sent, and its default is `COPY`. That is also why S3 refuses to copy an object
+    ///   onto itself (`InvalidRequest`) - such a copy would change nothing.
+    /// - **A missing source** is [`S3Error::KeyNotFound`].
+    /// - **A `200` is not yet a success.** An error the storage runs into while copying
+    ///   comes back as `200 OK` with an `<Error>` in the body, and it is an error here,
+    ///   typed from its `<Error><Code>` like any other. Only a complete
+    ///   `<CopyObjectResult>` says the object was copied.
+    ///
+    /// The key is percent-encoded in `x-amz-copy-source` exactly as in the path of a
+    /// request, so a key names the same object here as in [`Self::download_file`] or
+    /// [`Self::delete_file`]. A `/` in it stays a `/`.
+    ///
+    /// A transport failure is retried up to 3 times: the request has no body, and copying
+    /// the same source onto the same key again gives the same object.
+    ///
+    /// # Hetzner Object Storage
+    ///
+    /// - `CopyObject` is "only supported within the same Bucket".
+    /// - It "may fail depending on internal factors". Such a failure is returned as it
+    ///   is: whether to repeat the copy is the caller's decision, and
+    ///   [`S3Error::is_retryable`] is what to base it on.
+    ///
+    /// ```no_run
+    /// # async fn doc(s3: &my_s3::S3Client) -> Result<(), my_s3::S3Error> {
+    /// // "Renaming" drafts/report.pdf: a copy to the new key, then a delete of the old one.
+    /// s3.copy_file("my-bucket", "drafts/report.pdf", "my-bucket", "published/report.pdf")
+    ///     .await?;
+    /// s3.delete_file("my-bucket", "drafts/report.pdf").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn copy_file(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        dst_bucket: &str,
+        dst_key: &str,
+    ) -> Result<(), S3Error> {
+        // An empty name names no object. With an empty key the `PUT` goes to the bucket
+        // itself, where it creates a bucket rather than copying anything; with an empty
+        // bucket the key is taken for one.
+        let names = [
+            ("source bucket", src_bucket),
+            ("source key", src_key),
+            ("destination bucket", dst_bucket),
+            ("destination key", dst_key),
+        ];
+
+        if let Some((name, _)) = names.iter().find(|(_, value)| value.is_empty()) {
+            return Err(S3Error::Other(format!(
+                "Can not copy '{}/{}' to '{}/{}': the {} is empty",
+                src_bucket, src_key, dst_bucket, dst_key, name
+            )));
+        }
+
+        let fl_url = self
+            .new_request()
+            .append_path_segment(dst_bucket)
+            .append_path_segment(dst_key)
+            .with_retries(3);
+
+        let copy_source = copy_source(src_bucket, src_key);
+
+        let fl_url = super::utils::sign_request_with_headers(
+            self,
+            fl_url,
+            "PUT",
+            [].as_slice(),
+            &[("x-amz-copy-source", copy_source.as_str())],
+        )?;
+
+        // hyper writes no `Content-Length` for an empty body, and S3 refuses a `PUT`
+        // without one (`411 MissingContentLength`). It is not an `x-amz-*` header, so it
+        // needs no signing.
+        let fl_url = fl_url.with_header("Content-Length", "0");
+
+        let response = self
+            .send_put(fl_url, flurl::body::HttpRequestBody::empty())
+            .await?;
+
+        let status_code = response.get_status_code();
+        let body = self.read_success_body(response).await?;
+
+        read_copy_object_result(status_code, &body)
+    }
+
     /// Creates a bucket in [`Self::region`] - the same region the request is signed
     /// for.
     ///
@@ -1459,6 +1557,56 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
+/// The `x-amz-copy-source` naming `bucket_name`/`key`: `/{bucket}/{key}`, encoded by the
+/// same `UrlBuilder::append_path_segment` that encodes the path of every request.
+///
+/// The header and the path have to agree on what a key is called: a rename copies by
+/// this header and then deletes by the path, and the object deleted must be the one that
+/// was copied. `fl-url` encodes a path segment its own way - RFC 3986 `pchar`, so `+`,
+/// `!` or `(` go out as they are - and drops a leading `/` from it. Sharing its code is
+/// what keeps the two in step on a storage that decodes the header as it decodes the
+/// path. AWS reportedly reads a literal `+` in this header as a space, so there a key
+/// with a `+` in it may not be found.
+///
+/// A builder of its own rather than the request's url: an endpoint with a path of its
+/// own would otherwise end up in front of the bucket.
+fn copy_source(bucket_name: &str, key: &str) -> String {
+    // The host is a placeholder: only the path is read, and it does not depend on it.
+    let mut url_builder = flurl::my_http_utils::UrlBuilder::new("copy-source");
+    url_builder.append_path_segment(bucket_name);
+    url_builder.append_path_segment(key);
+    url_builder.get_path().to_string()
+}
+
+/// Reads the outcome of a `CopyObject` out of a 2xx answer, whose status alone does not
+/// say the copy happened.
+///
+/// The storage may answer `200` before it has copied anything, and then has nothing but
+/// the body to report a failure with: an `<Error>` there is an error, typed as
+/// [`detect_error`] types any other. It is looked for first, so that no answer carrying
+/// one is ever read as a success.
+///
+/// A success is a `<CopyObjectResult>` that is complete. Ceph opens that element before it
+/// copies and streams `<Progress>` into it while it does, and a copy that fails part-way
+/// can leave it open with no `<Error>` at all - `XmlWalker` refuses that, as it refuses any
+/// document that does not close what it opened. A body that is neither, an empty one
+/// included, is an error too: nothing in it says the object was copied.
+fn read_copy_object_result(status_code: u16, body: &[u8]) -> Result<(), S3Error> {
+    if crate::xml::read_node_text(body, "Error/Code").is_some() {
+        return Err(detect_error(status_code, body));
+    }
+
+    if let Ok(Some(_)) = crate::xml::XmlWalker::open(body, "CopyObjectResult") {
+        return Ok(());
+    }
+
+    Err(S3Error::Other(format!(
+        "CopyObject answered {} without a complete CopyObjectResult: {}",
+        status_code,
+        String::from_utf8_lossy(body)
+    )))
+}
+
 /// Maps a non-2xx answer onto a typed error.
 ///
 /// Prefers the `<Error><Code>` in the body over the status code, because the status
@@ -1819,5 +1967,90 @@ mod tests {
         let err = detect_error(418, b"teapot");
 
         assert_eq!(err.to_string(), "Status Code: 418. Err: teapot");
+    }
+
+    /// The copy source and the path of a request for the same object are one encoding,
+    /// whatever the key holds - including what `fl-url` leaves as it is (`+`, `(`), and a
+    /// leading `/` it drops.
+    #[test]
+    fn a_copy_source_is_the_path_of_a_request_for_that_object() {
+        for key in [
+            "a.bin",
+            "archives/2024/06/backup.tar",
+            "my folder/a file.txt",
+            "a+b (1) 100%?#.txt",
+            "отчёты/q1.pdf",
+            "/leading-slash.bin",
+        ] {
+            let request = flurl::FlUrl::new("https://fsn1.your-objectstorage.com")
+                .append_path_segment("my-bucket")
+                .append_path_segment(key);
+
+            assert_eq!(
+                copy_source("my-bucket", key),
+                request.get_url_builder().unwrap().get_path(),
+                "for {:?}",
+                key
+            );
+        }
+
+        assert_eq!(
+            copy_source("my-bucket", "my folder/a+b (1).txt"),
+            "/my-bucket/my%20folder/a+b%20(1).txt"
+        );
+    }
+
+    const COPY_OBJECT_RESULT: &str = r#"<?xml version="1.0" encoding="UTF-8"?><CopyObjectResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><LastModified>2026-10-14T12:00:00.000Z</LastModified><ETag>&quot;9b2cf535f27731c974343645a3985328&quot;</ETag></CopyObjectResult>"#;
+
+    #[test]
+    fn a_complete_copy_object_result_is_a_success() {
+        assert!(read_copy_object_result(200, COPY_OBJECT_RESULT.as_bytes()).is_ok());
+    }
+
+    /// AWS keeps a long copy's connection alive with whitespace ahead of the document,
+    /// and Ceph streams `<Progress>` into the result while it copies. Neither is a
+    /// failure.
+    #[test]
+    fn keep_alive_whitespace_and_progress_are_still_a_success() {
+        let body = "\n \n<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Progress>1048576</Progress><Progress>2097152</Progress><LastModified>2026-10-14T12:00:00.000Z</LastModified><ETag>&quot;9b2cf535f27731c974343645a3985328&quot;</ETag></CopyObjectResult>";
+
+        assert!(read_copy_object_result(200, body.as_bytes()).is_ok());
+    }
+
+    /// Ceph opens `<CopyObjectResult>` before it copies, and a copy that then fails can
+    /// end the answer right there: a 200, no `<Error>`, and a result never closed.
+    #[test]
+    fn a_result_that_was_never_closed_is_not_a_success() {
+        let body = r#"<?xml version="1.0" encoding="UTF-8"?><CopyObjectResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Progress>1048576</Progress>"#;
+
+        let err = read_copy_object_result(200, body.as_bytes()).unwrap_err();
+
+        assert!(matches!(err, S3Error::Other(_)), "got {:?}", err);
+    }
+
+    #[test]
+    fn an_empty_200_is_not_a_success() {
+        assert!(read_copy_object_result(200, b"").is_err());
+        assert!(read_copy_object_result(200, b"<html>OK</html>").is_err());
+    }
+
+    /// The error a copy runs into half-way arrives inside a 200, and it is typed - and
+    /// judged for a retry - the way it would be under a status of its own.
+    #[test]
+    fn an_error_inside_a_200_is_typed_like_any_other() {
+        let internal_error = "<Error><Code>InternalError</Code><Message>We encountered an internal error. Please try again.</Message></Error>";
+
+        let err = read_copy_object_result(200, internal_error.as_bytes()).unwrap_err();
+
+        assert_eq!(err.get_status_code(), Some(200));
+        assert!(err.is_retryable());
+
+        let no_such_key = "<Error><Code>NoSuchKey</Code><Message>gone</Message></Error>";
+
+        assert!(
+            read_copy_object_result(200, no_such_key.as_bytes())
+                .unwrap_err()
+                .is_key_not_found()
+        );
     }
 }

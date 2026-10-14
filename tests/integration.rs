@@ -1744,6 +1744,252 @@ async fn delete_reports_a_real_failure() {
 }
 
 // ---------------------------------------------------------------------------
+// CopyObject
+// ---------------------------------------------------------------------------
+
+/// `SignedHeaders` out of the `Authorization` a request went out with.
+fn signed_headers(captured: &fake_s3::Captured) -> &str {
+    captured
+        .header("authorization")
+        .and_then(|authorization| authorization.split("SignedHeaders=").nth(1))
+        .and_then(|rest| rest.split(',').next())
+        .unwrap()
+}
+
+/// What a rename rests on: the object at the new key holds the very bytes of the old
+/// one. They never pass through the client - the request carries no body at all.
+#[tokio::test]
+async fn a_copy_delivers_the_same_bytes() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let content = pattern(64 * 1024);
+    server.put_object("my-bucket", "drafts/report.pdf", content.clone());
+
+    client
+        .copy_file(
+            "my-bucket",
+            "drafts/report.pdf",
+            "my-bucket",
+            "published/report.pdf",
+        )
+        .await
+        .unwrap();
+
+    let copied = client
+        .download_file("my-bucket", "published/report.pdf")
+        .await
+        .unwrap();
+    assert_eq!(read_to_end(copied).await, content);
+
+    let captured = server.captured();
+    assert_eq!(captured[0].method, "PUT");
+    assert_eq!(captured[0].target, "/my-bucket/published/report.pdf");
+    assert!(captured[0].body.is_empty());
+    // A `PUT` without it is refused by S3 as 411 MissingContentLength.
+    assert_eq!(captured[0].header("content-length"), Some("0"));
+}
+
+/// SigV4 signs every `x-amz-*` header, and S3 refuses a request carrying one it was not
+/// signed with. A request with no header of its own is signed exactly as before.
+#[tokio::test]
+async fn the_copy_source_is_signed() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.put_object("my-bucket", "a.bin", b"a".to_vec());
+
+    client
+        .copy_file("my-bucket", "a.bin", "my-bucket", "b.bin")
+        .await
+        .unwrap();
+    client.delete_file("my-bucket", "a.bin").await.unwrap();
+
+    let captured = server.captured();
+
+    assert_eq!(
+        captured[0].header("x-amz-copy-source"),
+        Some("/my-bucket/a.bin")
+    );
+    assert_eq!(
+        signed_headers(&captured[0]),
+        "host;x-amz-content-sha256;x-amz-copy-source;x-amz-date"
+    );
+    assert!(
+        captured[0].signature_valid,
+        "signature did not verify: {:?}",
+        captured[0]
+    );
+
+    assert_eq!(captured[1].method, "DELETE");
+    assert_eq!(
+        signed_headers(&captured[1]),
+        "host;x-amz-content-sha256;x-amz-date"
+    );
+    assert!(captured[1].signature_valid);
+}
+
+/// A `/` in the source key stays a `/`: percent-encoded, it would name one object
+/// literally called `archives%2F2024...`.
+#[tokio::test]
+async fn a_copy_source_key_with_slashes_stays_a_path() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.put_object("my-bucket", "archives/2024/06/backup.tar", b"tar".to_vec());
+
+    client
+        .copy_file(
+            "my-bucket",
+            "archives/2024/06/backup.tar",
+            "my-bucket",
+            "archives/2024/07/backup.tar",
+        )
+        .await
+        .unwrap();
+
+    let captured = server.captured();
+    assert_eq!(
+        captured[0].header("x-amz-copy-source"),
+        Some("/my-bucket/archives/2024/06/backup.tar")
+    );
+    assert_eq!(captured[0].target, "/my-bucket/archives/2024/07/backup.tar");
+    assert!(captured[0].signature_valid);
+
+    let copied = client
+        .download_file("my-bucket", "archives/2024/07/backup.tar")
+        .await
+        .unwrap();
+    assert_eq!(read_to_end(copied).await, b"tar");
+}
+
+/// A key that has to be percent-encoded goes into the copy source exactly as into the
+/// path of a request for it - including what `fl-url` leaves as it is, `+` and `(`. The
+/// two must name the same object: a rename deletes by the path what it copied by this
+/// header.
+#[tokio::test]
+async fn a_copy_source_key_is_encoded_as_its_request_path() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let key = "отчёты/2024 q1/a+b (1) 100%?#.txt";
+    server.put_object("my-bucket", key, b"report".to_vec());
+
+    // The path a request for the source goes out with.
+    let source = client.download_file("my-bucket", key).await.unwrap();
+    assert_eq!(read_to_end(source).await, b"report");
+
+    client
+        .copy_file("my-bucket", key, "my-bucket", "archive/report.txt")
+        .await
+        .unwrap();
+
+    let captured = server.captured();
+    let copy_source = captured[1].header("x-amz-copy-source").unwrap();
+
+    assert_eq!(
+        copy_source,
+        "/my-bucket/%D0%BE%D1%82%D1%87%D1%91%D1%82%D1%8B/2024%20q1/a+b%20(1)%20100%25%3F%23.txt"
+    );
+    assert_eq!(copy_source, captured[0].target);
+    assert!(captured[1].signature_valid);
+
+    let copied = client
+        .download_file("my-bucket", "archive/report.txt")
+        .await
+        .unwrap();
+    assert_eq!(read_to_end(copied).await, b"report");
+}
+
+/// CopyObject may answer `200 OK` before it has copied anything, so an error it meets on
+/// the way can only come back inside that 200 - and it is an error, not a copy.
+#[tokio::test]
+async fn an_error_inside_a_200_is_not_a_copy() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.push_reply(
+        200,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InternalError</Code><Message>We encountered an internal error. Please try again.</Message></Error>",
+    );
+
+    let err = client
+        .copy_file("my-bucket", "a.bin", "my-bucket", "b.bin")
+        .await
+        .unwrap_err();
+
+    match &err {
+        my_s3::S3Error::UnexpectedStatusCode {
+            status_code,
+            error_code,
+            ..
+        } => {
+            assert_eq!(*status_code, 200);
+            assert_eq!(error_code.as_deref(), Some("InternalError"));
+        }
+        _ => panic!("expected UnexpectedStatusCode, got {:?}", err),
+    }
+
+    // Whether to repeat it is the caller's call, and this is what it is made on.
+    assert!(err.is_retryable());
+}
+
+/// A source that is not there is the typed "no such key" - the answer a `GET` for it
+/// gets - and nothing appears at the destination.
+#[tokio::test]
+async fn copying_a_missing_source_is_key_not_found() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.put_object("my-bucket", "other.bin", b"x".to_vec());
+
+    let err = client
+        .copy_file("my-bucket", "gone.bin", "my-bucket", "b.bin")
+        .await
+        .unwrap_err();
+
+    assert!(err.is_key_not_found(), "got {:?}", err);
+    assert!(!err.is_retryable());
+
+    let err = client
+        .download_file("my-bucket", "b.bin")
+        .await
+        .unwrap_err();
+    assert!(err.is_key_not_found(), "the destination must not exist");
+}
+
+/// An empty key names no object: the `PUT` would go to the bucket itself, which creates
+/// buckets. It is refused before anything is sent.
+#[tokio::test]
+async fn an_empty_name_is_refused_without_a_request() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    let err = client
+        .copy_file("my-bucket", "a.bin", "my-bucket", "")
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("the destination key is empty"),
+        "got {}",
+        err
+    );
+
+    let err = client
+        .copy_file("", "a.bin", "my-bucket", "b.bin")
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("the source bucket is empty"),
+        "got {}",
+        err
+    );
+    assert!(!err.is_retryable());
+
+    assert_eq!(server.connections_accepted(), 0);
+}
+
+// ---------------------------------------------------------------------------
 // Typed errors
 // ---------------------------------------------------------------------------
 
@@ -2869,6 +3115,40 @@ fn the_fake_server_canonicalises_a_query_the_way_a_real_one_does() {
     assert_eq!(fake_s3::canonical_query(ours), ours);
 }
 
+/// "The copy source is signed" is only worth asserting against a server that checks it
+/// the way S3 does: an `x-amz-*` header missing from `SignedHeaders` is a refusal,
+/// however well the rest of the request was signed. Otherwise a copy that forgot to
+/// sign it would pass here and fail against the storage.
+#[tokio::test]
+async fn the_fake_server_refuses_an_unsigned_amz_header() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.push_reply(204, "");
+    client.delete_file("my-bucket", "a.bin").await.unwrap();
+
+    let request = server.captured().remove(0);
+    assert!(fake_s3::verify_signature(
+        &request.method,
+        &request.target,
+        &request.headers,
+        &request.body
+    ));
+
+    let mut headers = request.headers.clone();
+    headers.push((
+        "x-amz-copy-source".to_string(),
+        "/my-bucket/b.bin".to_string(),
+    ));
+
+    assert!(!fake_s3::verify_signature(
+        &request.method,
+        &request.target,
+        &headers,
+        &request.body
+    ));
+}
+
 // ---------------------------------------------------------------------------
 // S3Reader - one object as a seekable source
 // ---------------------------------------------------------------------------
@@ -3548,6 +3828,7 @@ fn client_futures_are_send() {
             },
         ));
         assert_send(client.delete_file(bucket_name, key));
+        assert_send(client.copy_file(bucket_name, key, bucket_name, key));
         assert_send(client.create_bucket(bucket_name));
         assert_send(client.create_bucket_if_not_exists(bucket_name));
         assert_send(client.get_bucket_location(bucket_name));

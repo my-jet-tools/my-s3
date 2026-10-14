@@ -21,14 +21,14 @@ hex = "0.4"
 flurl = { tag = "0.7.0", git = "https://github.com/MyJetTools/fl-url.git", features = [
     "with-rust-tls",
 ] }
-my-xml-reader = { tag = "0.1.1", git = "https://github.com/MyJetTools/my-xml-reader" }
+my-xml-reader = { tag = "0.1.1", git = "https://github.com/my-jet-tools/my-xml-reader" }
 
 # `RequestBodyStream` lives here and `flurl` does not re-export it (only `hyper`,
 # `my_tls` and `my_http_utils`). The tag MUST stay equal to the one `flurl` pins,
 # otherwise the graph ends up with two `hyper::body::Body` traits and
 # `put_request_streamed` stops accepting our body with a "trait not implemented" that
 # looks like a library bug.
-my-http-client = { tag = "0.1.2", git = "https://github.com/MyJetTools/my-http-client.git" }
+my-http-client = { tag = "0.1.0", git = "https://github.com/my-jet-tools/my-http-client.git" }
 # `sync` for the mpsc channel a streamed body travels through (and the `Notify` that
 # holds a `start_upload` request back until its first chunk), `rt` for the
 # `tokio::spawn` that runs an `upload_with_writer` producer alongside the request and
