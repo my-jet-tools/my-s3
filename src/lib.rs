@@ -5,6 +5,8 @@ mod region;
 mod utils;
 pub use error::*;
 pub use region::*;
+mod list_buckets;
+pub use list_buckets::*;
 mod list_objects;
 mod xml;
 pub use list_objects::*;

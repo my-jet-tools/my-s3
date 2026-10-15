@@ -7,8 +7,8 @@ use tokio::sync::mpsc::Receiver;
 
 use super::upload_writer::{DEFAULT_UPLOAD_CHUNK_SIZE, UploadWriterState};
 use super::{
-    S3DownloadStream, S3Error, S3ListObjectsPage, S3ListObjectsRequest, S3Reader, S3Region,
-    S3UploadHandle, S3UploadWriter,
+    S3BucketInfo, S3DownloadStream, S3Error, S3ListObjectsPage, S3ListObjectsRequest, S3Reader,
+    S3Region, S3UploadHandle, S3UploadWriter,
 };
 
 /// `x-amz-content-sha256` value that tells S3 the payload is not covered by the
@@ -1014,6 +1014,73 @@ impl S3Client {
         let body = self.read_success_body(response).await?;
 
         parse_bucket_location(&body)
+    }
+
+    /// Every bucket the keys of the client can see - `ListBuckets`, `GET /` on the endpoint -
+    /// in the order the storage gives them. It names no bucket.
+    ///
+    /// Every page: AWS pages the list when asked to, and then ends a page with
+    /// `<ContinuationToken>`; that is asked with again until a page has none. Ceph (Hetzner)
+    /// and MinIO answer with one page.
+    ///
+    /// The keys need `s3:ListAllMyBuckets`; a `403 AccessDenied` is
+    /// [`S3Error::UnexpectedStatusCode`] with its code.
+    ///
+    /// ```no_run
+    /// # async fn doc(s3: &my_s3::S3Client) -> Result<(), my_s3::S3Error> {
+    /// for bucket in s3.list_buckets().await? {
+    ///     println!("{} {:?}", bucket.name, bucket.creation_date);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn list_buckets(&self) -> Result<Vec<S3BucketInfo>, S3Error> {
+        let mut buckets = Vec::new();
+        let mut continuation_token: Option<String> = None;
+
+        loop {
+            let page = self
+                .list_buckets_page(continuation_token.as_deref())
+                .await?;
+
+            buckets.extend(page.buckets);
+
+            match page.continuation_token {
+                // The token it was asked with: asked again, it would answer the same page forever.
+                Some(token) if continuation_token.as_deref() == Some(token.as_str()) => {
+                    return Err(S3Error::Other(
+                        "ListBuckets answered with the very token it was asked with".to_string(),
+                    ));
+                }
+                Some(token) => continuation_token = Some(token),
+                None => return Ok(buckets),
+            }
+        }
+    }
+
+    async fn list_buckets_page(
+        &self,
+        continuation_token: Option<&str>,
+    ) -> Result<crate::list_buckets::ListBucketsPage, S3Error> {
+        let mut fl_url = self.new_request();
+
+        // The first page is `GET /` with no query at all. A token is URI-encoded here, by the
+        // rule SigV4 signs with, and appended raw - as the query of a listing is.
+        if continuation_token.is_some() {
+            let mut query = String::new();
+            super::utils::append_query_param(&mut query, "continuation-token", continuation_token);
+            fl_url = fl_url.append_raw_ending_to_url(format!("/?{query}"));
+        }
+
+        let fl_url = fl_url.with_retries(3);
+
+        let fl_url = super::utils::sign_request(self, fl_url, "GET", [].as_slice())?;
+
+        let response = self.send_get(fl_url).await?;
+
+        let body = self.read_success_body(response).await?;
+
+        crate::list_buckets::parse_list_buckets(&body)
     }
 
     /// Whether the bucket is there and reachable with these credentials -

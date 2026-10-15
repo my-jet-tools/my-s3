@@ -160,6 +160,26 @@ not the one you are about to write to.
 keeps `403` an error, since that means either that the name belongs to someone else or
 that the credentials are wrong.
 
+### Listing the buckets
+
+```rust
+for bucket in s3.list_buckets().await? {                // -> Vec<S3BucketInfo>
+    println!("{} {:?}", bucket.name, bucket.creation_date);
+}
+
+// The same from a connection string: its `Bucket` is not read - write `*`.
+let buckets = my_s3::list_buckets(
+    "Endpoint=https://fsn1.your-objectstorage.com;Region=fsn1;AccessKey=...;SecretKey=...;Bucket=*",
+)
+.await?;
+```
+
+Every bucket the keys can see - `ListBuckets`, `GET /` on the endpoint, which names no bucket.
+Every page is read: AWS pages the list when asked to and ends a page with a
+`<ContinuationToken>`, which is asked with until a page has none. `<CreationDate>` and AWS's
+`<BucketRegion>` are kept as the storage writes them, `None` when it does not. The keys need
+`s3:ListAllMyBuckets`; a refusal is `UnexpectedStatusCode` with its code.
+
 ## Uploading
 
 ```rust

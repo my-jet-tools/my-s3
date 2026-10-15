@@ -3887,3 +3887,140 @@ fn client_futures_are_send() {
 
     let _ = check;
 }
+
+// ---------------------------------------------------------------------------
+// ListBuckets
+// ---------------------------------------------------------------------------
+
+fn buckets_xml(names: &[&str], continuation_token: Option<&str>) -> String {
+    let buckets: String = names
+        .iter()
+        .map(|name| {
+            format!(
+                "<Bucket><Name>{name}</Name><CreationDate>2025-01-02T03:04:05.000Z</CreationDate></Bucket>"
+            )
+        })
+        .collect();
+
+    let token = continuation_token
+        .map(|token| format!("<ContinuationToken>{token}</ContinuationToken>"))
+        .unwrap_or_default();
+
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Owner><ID>project</ID></Owner><Buckets>{buckets}</Buckets>{token}</ListAllMyBucketsResult>"#
+    )
+}
+
+/// `ListBuckets` names no bucket: a signed `GET` of the root, with nothing after it.
+#[tokio::test]
+async fn list_buckets_is_a_signed_get_of_the_root() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.push_reply(200, &buckets_xml(&["backups", "media"], None));
+
+    let buckets = client.list_buckets().await.unwrap();
+
+    let names: Vec<&str> = buckets.iter().map(|bucket| bucket.name.as_str()).collect();
+    assert_eq!(names, ["backups", "media"]);
+    assert_eq!(
+        buckets[0].creation_date.as_deref(),
+        Some("2025-01-02T03:04:05.000Z")
+    );
+
+    let captured = server.captured();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].method, "GET");
+    assert_eq!(captured[0].target, "/");
+    assert!(captured[0].signature_valid);
+}
+
+/// A token is asked with until a page has none, and every page is in the list. A token is
+/// encoded by the rule it is signed with: `+`, `/` and `=` of base64 included.
+#[tokio::test]
+async fn every_page_of_the_buckets_is_read() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.push_reply(200, &buckets_xml(&["a", "b"], Some("dG9r+ZW4/=")));
+    server.push_reply(200, &buckets_xml(&["c"], None));
+
+    let buckets = client.list_buckets().await.unwrap();
+
+    let names: Vec<&str> = buckets.iter().map(|bucket| bucket.name.as_str()).collect();
+    assert_eq!(names, ["a", "b", "c"]);
+
+    let captured = server.captured();
+    assert_eq!(captured.len(), 2);
+    assert_eq!(captured[1].target, "/?continuation-token=dG9r%2BZW4%2F%3D");
+    assert!(captured[0].signature_valid);
+    assert!(captured[1].signature_valid);
+}
+
+/// The token a page was asked with, given back as the next one, would be asked for forever.
+#[tokio::test]
+async fn the_same_token_twice_is_an_error_not_a_loop() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.push_reply(200, &buckets_xml(&["a"], Some("again")));
+    server.push_reply(200, &buckets_xml(&["b"], Some("again")));
+
+    assert!(client.list_buckets().await.is_err());
+    assert_eq!(server.request_count(), 2);
+}
+
+#[tokio::test]
+async fn a_refusal_to_list_the_buckets_is_typed() {
+    let server = FakeS3::start().await;
+    let client = server.client();
+
+    server.push_reply(
+        403,
+        "<Error><Code>AccessDenied</Code><Message>no</Message></Error>",
+    );
+
+    let err = client.list_buckets().await.unwrap_err();
+
+    assert_eq!(err.get_status_code(), Some(403));
+    assert!(!err.is_retryable(), "403 must not be retried");
+}
+
+/// The function of a connection string: its endpoint, region and keys - and its `Bucket` not
+/// read, `*` as it is meant to be written.
+#[tokio::test]
+async fn a_connection_string_lists_the_buckets_of_its_keys() {
+    let server = FakeS3::start().await;
+
+    server.push_reply(200, &buckets_xml(&["backups"], None));
+
+    let connection_string = format!(
+        "Endpoint={};Region={};AccessKey={};SecretKey={};Bucket=*",
+        server.endpoint,
+        fake_s3::REGION.as_str(),
+        fake_s3::ACCESS_KEY,
+        fake_s3::SECRET_KEY
+    );
+
+    let buckets = my_s3::list_buckets(&connection_string).await.unwrap();
+
+    assert_eq!(buckets.len(), 1);
+    assert_eq!(buckets[0].name, "backups");
+
+    let captured = server.captured();
+    assert_eq!(captured[0].target, "/");
+    assert!(captured[0].signature_valid);
+}
+
+#[tokio::test]
+async fn a_connection_string_which_can_not_be_read_asks_nothing() {
+    let err = my_s3::list_buckets(
+        "Endpoint=https://fsn1.your-objectstorage.com;AccessKey=a;SecretKey=s;Bucket=*",
+    )
+    .await
+    .unwrap_err();
+
+    let text = err.to_string();
+    assert!(text.contains("can not be read"), "{text}");
+    assert!(text.contains("Region"), "{text}");
+}
